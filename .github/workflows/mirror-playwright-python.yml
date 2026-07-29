@@ -1,0 +1,74 @@
+name: mirror-playwright-python
+
+on:
+  workflow_dispatch:
+    inputs:
+      tags:
+        description: "コピーするタグ (空白区切り)。空なら MCR の最新バージョンを自動検出"
+        required: false
+        default: ""
+  schedule:
+    # 毎週火曜 05:00 JST (= 月曜 20:00 UTC)
+    - cron: "0 20 * * 1"
+
+concurrency:
+  group: mirror-playwright-python
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  SRC: mcr.microsoft.com/playwright/python
+  DST: ghcr.io/${{ github.repository_owner }}/playwright-python
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: imjasonh/setup-crane@v0.7
+
+      - name: Login to ghcr.io
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_ACTOR: ${{ github.actor }}
+        run: |
+          echo "$GH_TOKEN" | crane auth login ghcr.io -u "$GH_ACTOR" --password-stdin
+
+      - name: Resolve tags
+        id: resolve
+        env:
+          # 信頼できない値として env 経由で渡す (run: への直接展開はしない)
+          INPUT_TAGS: ${{ inputs.tags }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_TAGS:-}" ]; then
+            tags="$INPUT_TAGS"
+          else
+            tags="$(python3 scripts/resolve-playwright-python-tags.py)"
+          fi
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+          echo "mirror targets: ${tags}"
+
+      - name: Mirror
+        env:
+          TAGS: ${{ steps.resolve.outputs.tags }}
+        run: |
+          set -euo pipefail
+          for t in $TAGS; do
+            src="${SRC}:${t}"
+            dst="${DST}:${t}"
+            src_digest="$(crane digest "$src")"
+            dst_digest="$(crane digest "$dst" 2>/dev/null || true)"
+            if [ "$src_digest" = "$dst_digest" ]; then
+              echo "::notice::skip ${t} (already mirrored, ${src_digest})"
+              continue
+            fi
+            echo "::group::copy ${t}"
+            crane copy "$src" "$dst"
+            echo "::endgroup::"
+            echo "::notice::mirrored ${t} -> ${dst} (${src_digest})"
+          done
